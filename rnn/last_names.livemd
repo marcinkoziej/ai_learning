@@ -1,0 +1,302 @@
+# RNN last name categorizer
+
+```elixir
+Mix.install(
+  [
+    {:kino_bumblebee, "~> 0.3.0"},
+    {:exla, "~> 0.5.1"},
+    :nx,
+    :axon,
+    :unidecode,
+    {:kino_vega_lite, "~> 0.1.7"}
+  ],
+  config: [nx: [default_backend: EXLA.Backend]]
+)
+```
+
+## Task
+
+Rewrite this [task](https://pytorch.org/tutorials/intermediate/char_rnn_classification_tutorial.html) from python (pytroch) to elixir using Axon framework
+
+## Preparing data
+
+We have a data file with countries (categories) and last names of people from these countries.
+Read in the data, determine category space (`n_letters, n_categories`)
+
+```elixir
+data_dir = "rnn/data/names"
+
+category_lines =
+  for name <- File.ls!(data_dir) do
+    lines =
+      File.read!(data_dir <> "/" <> name)
+      |> String.split("\n")
+      |> Enum.map(&Unidecode.decode/1)
+
+    [name, _ext] = String.split(name, ".")
+    {name, lines}
+  end
+  |> Enum.into(%{})
+
+all_categories = Map.keys(category_lines)
+n_categories = length(all_categories)
+
+all_letters = ?a..?z |> Enum.to_list() |> List.to_string()
+all_letters = all_letters <> (?A..?Z |> Enum.to_list() |> List.to_string())
+# why these are added?
+
+all_letters = all_letters <> " .,;'"
+n_letters = String.length(all_letters)
+
+"n_categories: #{n_categories}, n_letters: #{n_letters}"
+```
+
+## RNN model
+
+The RNN from pytorch example, written by hand (not using `Axon.Layer.*` here because this is an exercise).
+
+For each letter of input sequence (the last name) forward pass is as follows:
+
+* input -> hidden layer (shapes: input_size + hidden_size -> hidden_size)
+* hidden -> output (shapes: hidden_size -> output_size)
+* softmax(output)
+
+```elixir
+defmodule RNN do
+  @moduledoc """
+  Input is a batch of series of letters of hot-one vectors.
+
+  {batch, line_length, 1, hot-one vector}
+
+
+  """
+
+  import Nx.Defn
+
+  @n_hidden 128
+
+  @doc """
+  The RNN hidden vector of values passed from one sequence item to next
+  """
+  defn init_hidden() do
+    Nx.broadcast(0.0, {1, @n_hidden})
+  end
+
+  @doc """
+  Forwad pass for single letter:
+
+  1. combine input and hidden along the axis 1
+  {1,57} + {1,128} = {1,185}
+
+       #combined = torch.cat((input, hidden), 1)
+
+  2. calculate hidden from combined to hidden (standard neuron operation `sigmoid(x*wT + b)`)
+  {1,185} * {185,128} + {128} = {1,128}
+
+        # hidden = self.i2h(combined)
+
+  3. now calcualte output from hidden (standard neuron operation)
+  {1,128} * {128,18} + {18} = {1,18} categories 
+
+  4. Apply softmax to this 
+
+  return {output, hidden}, pass on hidden to next letter, in the end return final output
+  """
+  defn forward_one(input, hidden, parameters = {i2h_weights, i2h_bias, h2o_weights, h2o_bias}) do
+    input_hidden = Nx.concatenate([input, hidden], axis: 1)
+    # Kernel.print_expr({Nx.shape(input_hidden), Nx.shape(i2h_weights)}, label: "SHAPSE")
+    hidden = input_hidden |> linear(i2h_weights, i2h_bias)
+    output = hidden |> linear(h2o_weights, h2o_bias)
+
+    output = Axon.Activations.softmax(output, axis: 1)
+
+    {output, hidden, parameters}
+  end
+
+  defn forward(input, i2h_weights, i2h_bias, h2o_weights, h2o_bias, _opts \\ []) do
+    # remove the batch dim 
+    # I assume batch size=1 
+    input = input[0]
+
+    output = Nx.broadcast(0.0, {1, 18})
+    parameters = {i2h_weights, i2h_bias, h2o_weights, h2o_bias}
+
+    result =
+      while {output, hidden = init_hidden(), parameters}, letter <- input do
+        {_output, hidden, parameters} = forward_one(letter, hidden, parameters)
+      end
+
+    output = elem(result, 0)
+
+    # re-add the batch dimension
+    output |> prepend_dim()
+  end
+
+  @doc "Prepend a batch dimension so {3,4} shape becomes {1,3,4}"
+  deftransform prepend_dim(tensor) do
+    shape = Nx.shape(tensor)
+    tensor |> Nx.reshape(Tuple.insert_at(shape, 0, 1))
+  end
+
+  @doc """
+  Typical NN transformation `sigmoid(x*wT + b)`
+  """
+  defn linear(input, weights, bias) do
+    input
+    |> Nx.dot(weights)
+    |> Nx.add(bias)
+    |> Axon.Activations.sigmoid()
+  end
+
+  @doc """
+  Build the model from:
+  1. input
+  2. one RNN layer, which does `dynamic_unroll` (`Nx.while`) as well as all activations (sigmoid, softmax)  
+  """
+  def model(n_letters, n_categories) do
+    input = Axon.input("input", shape: {1, nil, 1, n_letters})
+
+    i2h_weights = Axon.param("i2h_weights", fn _ -> {n_letters + @n_hidden, @n_hidden} end)
+    i2h_bias = Axon.param("i2h_bias", fn _ -> {@n_hidden} end, initializer: :zeros)
+
+    h2o_weights = Axon.param("h2o_weights", fn _ -> {@n_hidden, n_categories} end)
+    h2o_bias = Axon.param("h2o_bias", fn _ -> {n_categories} end, initializer: :zeros)
+
+    Axon.layer(
+      &forward/6,
+      [input, i2h_weights, i2h_bias, h2o_weights, h2o_bias],
+      op_name: :rnn,
+      name: "rnn"
+    )
+  end
+
+  def display(_model) do
+    # Axon.Display.as_graph(model, Nx.template({1, n_letters + @n_hidden}, :f32))
+  end
+
+  def n_hidden(), do: @n_hidden
+end
+```
+
+### Utilities
+
+Add utility module to convert data to tensors
+
+```elixir
+defmodule Utils do
+  @doc """
+  Convert a letter into {1, 57} vectors with 1 in position of the letter in alphabet ordering
+  """
+  def letter_to_hotone(letter, all_letters) do
+    all_letters = String.to_charlist(all_letters)
+    idx = Enum.find_index(all_letters, fn x -> x == letter end)
+
+    v =
+      0..(length(all_letters) - 1)
+      |> Enum.map(fn i -> if i == idx, do: 1, else: 0 end)
+
+    Nx.tensor([v], type: :u8)
+  end
+
+  @doc """
+  Convert a word to tensor containing series of hot-one vectors. Shape {word_len, 1, 57}
+  """
+  def word_to_tensor(word, all_letters) do
+    word = String.to_charlist(word)
+
+    v =
+      for ch <- word do
+        letter_to_hotone(ch, all_letters)
+      end
+
+    Nx.concatenate(v)
+    |> Nx.reshape({length(word), 1, String.length(all_letters)})
+  end
+
+  @doc """
+  Convert category (country) to one-hot vector where 1 is in position of the category in list.
+  """
+  def category_to_tensor(category, all_categories) do
+    idx = Enum.find_index(all_categories, fn x -> x == category end)
+
+    v =
+      0..(length(all_categories) - 1)
+      |> Enum.map(fn i -> if i == idx, do: 1, else: 0 end)
+
+    Nx.tensor([v])
+  end
+
+  @doc """
+  Generate a random training set
+  - data - 1-element batches of word tensors 
+  - category - 1-element batch of category vector
+  """
+  def training_set(category_lines, all_categories, all_letters, size \\ 100) do
+    flat =
+      for {cat, lines} <- category_lines, line <- lines do
+        {cat, line}
+      end
+
+    Stream.repeatedly(fn -> Enum.random(flat) end)
+    |> Enum.take(size)
+    |> Enum.map(fn {cat, line} ->
+      {
+        word_to_tensor(line, all_letters)
+        |> Nx.reshape({1, :auto, 1, String.length(all_letters)}),
+        category_to_tensor(cat, all_categories) |> Nx.reshape({1, 1, length(all_categories)})
+      }
+    end)
+  end
+end
+```
+
+## Train
+
+```elixir
+# Can we just run it with untrained weights?
+model = RNN.model(n_letters, n_categories)
+
+# XXX this is probably wrong?
+input_tmpl = Nx.template({1, 1, 1, n_letters}, :u8)
+
+train = Utils.training_set(category_lines, all_categories, all_letters, 10)
+
+# Agent to hold stats (how loss changes in time)
+{:ok, stat} = Agent.start_link(fn -> [] end, name: Stats)
+
+loop =
+  Axon.Loop.trainer(model, :mean_squared_error, Axon.Optimizers.sgd(), log: 0, seed: 50)
+  |> Axon.Loop.handle_event(
+    :epoch_completed,
+    fn s ->
+      loss = Nx.to_flat_list(s.metrics["loss"])
+      Agent.update(stat, fn x -> [loss | x] end)
+
+      {:continue, s}
+    end,
+    every: 10_000
+  )
+
+[{x, y}, {x2, y2} | _] = train
+IO.inspect(Nx.shape(x), label: "first example")
+IO.inspect(Nx.shape(x2), label: "second example")
+IO.puts("It will crash on these unequal shapes:")
+params = Axon.Loop.run(loop, train, %{}, epochs: 1_000_000)
+```
+
+```elixir
+loss_stat =
+  Agent.get(Stat, &Enum.reverse(&1))
+  |> Enrum.drop(1)
+  |> Enum.with_index(fn [loss], i -> %{"t" => i, "loss" => loss} end)
+```
+
+<!-- livebook:{"attrs":{"chart_title":null,"height":null,"layers":[{"active":true,"chart_type":"point","color_field":null,"color_field_aggregate":null,"color_field_bin":null,"color_field_scale_scheme":null,"color_field_type":null,"data_variable":"category_lines","geodata_color":"blue","latitude_field":null,"longitude_field":null,"x_field":"Arabic","x_field_aggregate":null,"x_field_bin":null,"x_field_scale_type":null,"x_field_type":"nominal","y_field":"Chinese","y_field_aggregate":null,"y_field_bin":null,"y_field_scale_type":null,"y_field_type":"nominal"}],"vl_alias":"Elixir.VegaLite","width":null},"chunks":null,"kind":"Elixir.KinoVegaLite.ChartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+VegaLite.new()
+|> VegaLite.data_from_values(category_lines, only: ["Arabic", "Chinese"])
+|> VegaLite.mark(:point)
+|> VegaLite.encode_field(:x, "Arabic", type: :nominal)
+|> VegaLite.encode_field(:y, "Chinese", type: :nominal)
+```
